@@ -7,10 +7,11 @@ const S = {
   fragments: [],
   groups: [],
   relations: [],
-  mode: 'view',                       // view | draw | relate
+  mode: 'view',                       // view | draw | relate | revise
   cam: { scale: 6, ox: 0, oy: 0 },    // 像素/毫米 + 原点偏移
   draw: { name: '', points: [] },
   relate: { aId: null, bId: null, markersA: [], markersB: [], preview: null },
+  revise: { fid: null, points: [], markers: {}, preview: null },
   trial: { steps: [], rehearsal: null, busy: false },
   camInit: false,
 };
@@ -60,6 +61,12 @@ async function loadAssembly() {
   S.groups = data.groups;
   S.relations = data.relations;
   S.trial = { steps: [], rehearsal: null, busy: false };  // 刷新后旧试拼作废
+  if (S.mode === 'revise') {                              // 刷新后未确认的修订作废
+    S.revise = { fid: null, points: [], markers: {}, preview: null };
+    S.mode = 'view';
+    document.querySelectorAll('.mode-btn').forEach(b =>
+      b.classList.toggle('active', b.dataset.mode === 'view'));
+  }
   $('#versionBadge').textContent = `版本 v${S.version}`;
   renderPanel();
   renderMain();
@@ -158,6 +165,12 @@ function applyPose(p, f) {
 }
 const worldContour = f => f.contour.map(p => applyPose(p, f));
 
+function applyInversePose(p, f) {
+  const c = Math.cos(f.theta), s = Math.sin(f.theta);
+  const dx = p[0] - f.x, dy = p[1] - f.y;
+  return [c * dx + s * dy, -s * dx + c * dy];
+}
+
 function centroid(pts) {
   let x = 0, y = 0;
   for (const p of pts) { x += p[0]; y += p[1]; }
@@ -255,6 +268,47 @@ function renderMain() {
   ctx.clearRect(0, 0, w, h);
   drawGrid(w, h);
 
+  // 轮廓修订：其余碎片照常绘制，本碎片按现有位姿画修订轮廓与预览标记
+  if (S.mode === 'revise') {
+    const R = S.revise;
+    const f = fragById(R.fid);
+    if (f) {
+      for (const g of S.fragments) {
+        if (g.id !== f.id) drawFragment(g, {});
+      }
+      const wc = R.points.map(p => applyPose(p, f));   // 位姿不变
+      if (wc.length >= 3) {
+        drawFragment({ id: f.id, name: f.name, group_id: f.group_id, contour: [] },
+                     { contour: wc, highlight: true, color: '#d35400', name: f.name });
+      } else if (wc.length) {
+        ctx.beginPath();
+        wc.forEach((p, i) => {
+          const [sx, sy] = toScreen(p[0], p[1]);
+          i === 0 ? ctx.moveTo(sx, sy) : ctx.lineTo(sx, sy);
+        });
+        ctx.strokeStyle = '#d35400'; ctx.lineWidth = 2; ctx.stroke();
+      }
+      wc.forEach((p, i) => {
+        const [sx, sy] = toScreen(p[0], p[1]);
+        ctx.fillStyle = '#d35400';
+        ctx.beginPath(); ctx.arc(sx, sy, 3.5, 0, 7); ctx.fill();
+        ctx.fillStyle = '#6b5433'; ctx.font = '10px sans-serif';
+        ctx.fillText(`${i + 1}`, sx + 5, sy - 5);
+      });
+      const pv = R.preview;
+      if (pv && pv.relations) {
+        const color = pv.ok ? '#2e86c1' : '#c0392b';
+        for (const rel of pv.relations) {
+          rel.markers_self_world.forEach((wa, i) => {
+            const err = rel.errors[i] != null ? ` ${rel.errors[i].toFixed(2)}mm` : '';
+            drawMarkerPair(wa, rel.markers_other_world[i], i, err, color);
+          });
+        }
+      }
+    }
+    return;
+  }
+
   const pv = S.mode === 'relate' ? S.relate.preview : null;
   const pvIds = pv ? new Set(pv.placements.map(p => p.fragment_id)) : new Set();
 
@@ -319,6 +373,8 @@ function renderMain() {
 
 // ---------------------------------------------------------------- 侧栏面板
 const fragById = id => S.fragments.find(f => f.id === id);
+const activeRelationsOf = fid =>
+  S.relations.filter(r => r.active && (r.fragment_a === fid || r.fragment_b === fid));
 const fmt = (v, n = 2) => (+v).toFixed(n);
 const deg = r => (r * 180 / Math.PI).toFixed(2);
 
@@ -326,15 +382,18 @@ function renderPanel() {
   const el = $('#panel');
   if (S.mode === 'view') el.innerHTML = viewPanelHTML();
   else if (S.mode === 'draw') el.innerHTML = drawPanelHTML();
+  else if (S.mode === 'revise') el.innerHTML = revisePanelHTML();
   else el.innerHTML = relatePanelHTML();
   bindPanelEvents();
   if (S.mode === 'relate') drawMinis();
+  if (S.mode === 'revise') drawReviseMinis();
   $('#hint').textContent = {
     view: trialAssembly()
       ? '有序试拼预演结果（蓝色，不落库）· 侧栏可确认整组提交 · 拖拽平移 · 滚轮缩放'
       : '拖拽平移 · 滚轮缩放 · 单位：毫米',
     draw: '单击画布添加顶点（≥3 个）· 拖拽平移 · 滚轮缩放 · 保存时自动闭合',
     relate: '在左侧两个小图中点击轮廓边缘放置对应标记（每片 ≥2 处、数量一致），然后预览/采纳/加入试拼',
+    revise: '修订轮廓：主画布单击添加顶点（按当前位姿放入世界坐标）· 在每条关系的小图中点击边缘放置新标记 · 先预览再确认',
   }[S.mode];
 }
 
@@ -346,6 +405,7 @@ function viewPanelHTML() {
       <div class="row">
         <span><span class="dot" style="background:${groupColor(f.group_id)}"></span><b>#${f.id} ${esc(f.name)}</b></span>
         <span class="spacer"></span>
+        <button class="act" data-revise="${f.id}">修订轮廓</button>
         <button class="act danger" data-del-frag="${f.id}">删除</button>
       </div>
       <div class="sub">${f.group_id == null ? '独立碎片' : `拼接组 G${f.group_id}`} ·
@@ -487,9 +547,73 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function revisePanelHTML() {
+  const R = S.revise;
+  const f = fragById(R.fid);
+  if (!f) return '<div class="small">碎片不存在，请返回「查看装配」。</div>';
+  const rels = activeRelationsOf(R.fid);
+  const pts = R.points.map((p, i) =>
+    `<div class="small mono">${i + 1}. (${fmt(p[0])}, ${fmt(p[1])})</div>`).join('');
+  const relCards = rels.map(r => {
+    const otherId = r.fragment_a === R.fid ? r.fragment_b : r.fragment_a;
+    const need = (r.fragment_a === R.fid ? r.markers_b : r.markers_a).length;
+    const cur = (R.markers[r.id] || []).length;
+    return `
+      <div class="card">
+        <div><b>关系 #${r.id}</b> ↔ ${esc(fragById(otherId)?.name || '?')}</div>
+        <div class="sub">需 ${need} 处新标记（与另一端一致）· 已放 ${cur} 处</div>
+        <canvas class="mini" id="revMini${r.id}"></canvas>
+        <div class="row" style="margin-top:4px"><span class="spacer"></span>
+          <button class="act" data-rev-undo-marker="${r.id}" ${cur ? '' : 'disabled'}>撤销标记</button>
+        </div>
+      </div>`;
+  }).join('');
+  let pvHTML = '';
+  const pv = R.preview;
+  if (pv) {
+    const rows = (pv.relations || []).map(r =>
+      `<tr><td>#${r.relation_id} ↔ ${esc(r.other_fragment_name)}</td>` +
+      `<td>${r.errors.map(e => fmt(e, 3)).join(', ')}</td>` +
+      `<td>${r.max_error_mm <= 1 ? '✓' : '✗ 超限'}</td></tr>`).join('');
+    pvHTML = `
+      <h2>修订预览</h2>
+      ${pv.ok
+        ? '<div class="okbox">✓ 校验通过：逐条误差均 ≤ 1 mm，成员轮廓无内部重叠，可确认修订。</div>'
+        : `<div class="conflicts"><b>存在冲突，确认将被拒绝：</b><ul>${pv.conflicts.map(c => `<li>${esc(c)}</li>`).join('')}</ul></div>`}
+      ${rows ? `<table class="info"><tr><th>关系</th><th>逐对误差 (mm)</th><th>判定</th></tr>${rows}</table>` : ''}`;
+  }
+  const canPreview = R.points.length >= 3;
+  const canCommit = pv && pv.ok;
+  return `
+    <h2>修订轮廓：#${f.id} ${esc(f.name)}</h2>
+    <div class="sub">位姿保持不变：位置 (${fmt(f.x)}, ${fmt(f.y)}) mm · 角度 ${deg(f.theta)}° ·
+      ${f.group_id == null ? '独立碎片（仅校验轮廓）' : `拼接组 G${f.group_id}`}</div>
+    <label class="lab">修订轮廓顶点（毫米，${R.points.length} 个）· 在主画布单击增点</label>
+    <div style="max-height:140px;overflow:auto">${pts || '<div class="small">尚无顶点</div>'}</div>
+    <div class="row" style="margin-top:6px">
+      <button class="act" id="revUndoPt" ${R.points.length ? '' : 'disabled'}>撤销顶点</button>
+      <button class="act" id="revClearPts" ${R.points.length ? '' : 'disabled'}>清空</button>
+      <button class="act" id="revResetPts">重置为当前轮廓</button>
+    </div>
+    <label class="lab">或粘贴坐标 JSON</label>
+    <textarea id="revJson" rows="3" placeholder='[[0,0],[50,0],[50,40],[0,40]]'></textarea>
+    <div class="row" style="margin-top:6px"><button class="act" id="revLoadJson">载入坐标</button></div>
+    ${rels.length
+      ? `<h2>新边缘标记（${rels.length} 条有效关系）</h2>${relCards}`
+      : '<h2>新边缘标记</h2><div class="small">该碎片无有效拼接关系，仅校验轮廓。</div>'}
+    <div class="row" style="margin-top:10px">
+      <button class="act" id="btnRevPreview" ${canPreview ? '' : 'disabled'}>预 览</button>
+      <button class="act primary" id="btnRevCommit" ${canCommit ? '' : 'disabled'}>确认修订</button>
+      <button class="act" id="btnRevCancel">取消</button>
+    </div>
+    <div class="small" style="margin-top:4px">预览不落库；确认按同一输入重新校验，全部通过才原子写入（轮廓 + 相关标记 + 误差），装配版本只 +1。</div>
+    ${pvHTML}`;
+}
+
 // ---------------------------------------------------------------- 面板事件
 function bindPanelEvents() {
   document.querySelectorAll('[data-del-frag]').forEach(b => b.onclick = () => deleteFragment(+b.dataset.delFrag));
+  document.querySelectorAll('[data-revise]').forEach(b => b.onclick = () => startRevise(+b.dataset.revise));
   document.querySelectorAll('[data-undo]').forEach(b => b.onclick = () => undoRelation(+b.dataset.undo));
   document.querySelectorAll('[data-trial-undo-rel]').forEach(b =>
     b.onclick = () => addTrialStep({ action: 'undo', relation_id: +b.dataset.trialUndoRel }));
@@ -528,6 +652,35 @@ function bindPanelEvents() {
     $('#btnAddTrial').onclick = addRelateToTrial;
     bindMini($('#miniA'), 'A');
     bindMini($('#miniB'), 'B');
+  }
+
+  if (S.mode === 'revise') {
+    const R = S.revise;
+    const f = fragById(R.fid);
+    $('#revUndoPt').onclick = () => { R.points.pop(); R.preview = null; renderPanel(); renderMain(); };
+    $('#revClearPts').onclick = () => { R.points = []; R.preview = null; renderPanel(); renderMain(); };
+    $('#revResetPts').onclick = () => {
+      if (f) R.points = f.contour.map(p => [p[0], p[1]]);
+      R.preview = null; renderPanel(); renderMain();
+    };
+    $('#revLoadJson').onclick = () => {
+      try {
+        const arr = JSON.parse($('#revJson').value);
+        if (!Array.isArray(arr) || arr.some(p => !Array.isArray(p) || p.length < 2)) throw 0;
+        R.points = arr.map(p => [+p[0], +p[1]]);
+        R.preview = null;
+        renderPanel(); renderMain();
+      } catch { setMessage('坐标 JSON 格式不正确', 'err'); }
+    };
+    document.querySelectorAll('[data-rev-undo-marker]').forEach(b => b.onclick = () => {
+      const ms = R.markers[+b.dataset.revUndoMarker];
+      if (ms) ms.pop();
+      R.preview = null; renderPanel(); renderMain();
+    });
+    $('#btnRevPreview').onclick = doRevisePreview;
+    $('#btnRevCommit').onclick = doReviseCommit;
+    $('#btnRevCancel').onclick = () => switchMode('view');
+    for (const r of activeRelationsOf(R.fid)) bindReviseMini($('#revMini' + r.id), r.id);
   }
 }
 
@@ -632,6 +785,63 @@ async function deleteFragment(fid) {
   }
 }
 
+// ---------------------------------------------------------------- 轮廓修订
+function startRevise(fid) {
+  const f = fragById(fid);
+  if (!f) return;
+  S.revise = {
+    fid,
+    points: f.contour.map(p => [p[0], p[1]]),
+    markers: Object.fromEntries(activeRelationsOf(fid).map(r => [r.id, []])),
+    preview: null,
+  };
+  switchMode('revise');
+}
+
+function revisionPayload() {
+  const R = S.revise;
+  return {
+    contour: R.points,
+    relation_markers: Object.keys(R.markers)
+      .map(rid => ({ relation_id: +rid, markers: R.markers[rid] })),
+  };
+}
+
+async function doRevisePreview() {
+  const R = S.revise;
+  try {
+    R.preview = await api(`/api/fragments/${R.fid}/revision/preview`, {
+      method: 'POST',
+      body: JSON.stringify(revisionPayload()),
+    });
+    renderPanel(); renderMain();
+  } catch (err) {
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
+async function doReviseCommit() {
+  const R = S.revise;
+  const name = fragById(R.fid)?.name;
+  try {
+    const res = await api(`/api/fragments/${R.fid}/revision`, {
+      method: 'POST',
+      body: JSON.stringify({ ...revisionPayload(), expected_version: S.version }),
+    });
+    setMessage(`碎片「${name}」轮廓已修订，装配版本 v${res.version}`);
+    S.revise = { fid: null, points: [], markers: {}, preview: null };
+    applyAssembly(res.assembly);
+    switchMode('view');
+  } catch (err) {
+    if (err.status === 409) return handleConflict(err);          // 过期版本
+    if (err.detail && err.detail.conflicts) {                    // 校验拒绝：展示冲突
+      R.preview = { ok: false, conflicts: err.detail.conflicts, relations: [], contour_world: null };
+      renderPanel(); renderMain();
+    }
+    setMessage(detailText(err.detail), 'err');
+  }
+}
+
 function applyAssembly(a) {
   S.version = a.version;
   S.fragments = a.fragments;
@@ -707,6 +917,42 @@ function drawMinis() {
   $('#miniA')._t = tA; $('#miniB')._t = tB;
 }
 
+function drawReviseMinis() {
+  const R = S.revise;
+  for (const r of activeRelationsOf(R.fid)) {
+    const cv = $('#revMini' + r.id);
+    if (!cv) continue;
+    if (R.points.length >= 3) {
+      cv._t = drawMini(cv, { contour: R.points }, R.markers[r.id] || []);
+    } else {
+      cv._t = null;
+      const dpr = window.devicePixelRatio || 1;
+      cv.width = cv.clientWidth * dpr; cv.height = cv.clientHeight * dpr;
+      const c = cv.getContext('2d');
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, cv.clientWidth, cv.clientHeight);
+      c.fillStyle = '#999';
+      c.fillText('请先完善修订轮廓（≥3 个顶点）', 10, 20);
+    }
+  }
+}
+
+function bindReviseMini(cv, rid) {
+  if (!cv) return;
+  cv.onclick = e => {
+    const R = S.revise;
+    const t = cv._t;
+    if (!t || R.points.length < 3) return;
+    const rect = cv.getBoundingClientRect();
+    const px = e.clientX - rect.left, py = e.clientY - rect.top;
+    const local = [(px - t.ox) / t.s, -(py - t.oy) / t.s];
+    const snapped = snapToContour(local, R.points);   // 边缘标记：吸附到修订轮廓
+    (R.markers[rid] = R.markers[rid] || []).push(snapped);
+    R.preview = null;
+    renderPanel(); renderMain();
+  };
+}
+
 function bindMini(cv, side) {
   cv.onclick = e => {
     const R = S.relate;
@@ -744,6 +990,14 @@ canvas.addEventListener('mouseup', e => {
   if (wasClick && S.mode === 'draw') {
     S.draw.points.push(toWorld(e.offsetX, e.offsetY).map(v => +v.toFixed(3)));
     renderPanel(); renderMain();
+  } else if (wasClick && S.mode === 'revise') {
+    const f = fragById(S.revise.fid);
+    if (f) {   // 世界坐标 → 碎片局部坐标（位姿不变，轮廓随位姿放置）
+      const local = applyInversePose(toWorld(e.offsetX, e.offsetY), f);
+      S.revise.points.push(local.map(v => +v.toFixed(3)));
+      S.revise.preview = null;
+      renderPanel(); renderMain();
+    }
   }
 });
 canvas.addEventListener('mouseleave', () => { drag = null; });

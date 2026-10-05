@@ -14,6 +14,7 @@ MAX_ERROR_MM = 1.0        # 同组对应点误差上限（毫米）
 OVERLAP_AREA_TOL = 1e-6   # 轮廓内部重叠面积容差（mm²）
 MARKER_DIST_TOL = 1e-6    # 标记重合判定距离（mm）
 CLOSE_TOL = 1e-9          # 闭合重复点判定容差
+MARKER_EDGE_TOL = 0.01    # 标记须位于轮廓边缘的容差（mm）
 
 
 class GeometryError(ValueError):
@@ -76,6 +77,33 @@ def validate_markers(markers_a, markers_b):
 
 
 # ---------------------------------------------------------------- 刚体变换
+
+def _point_segment_dist(p, a, b) -> float:
+    """点到线段的最短距离。"""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    len2 = dx * dx + dy * dy
+    t = 0.0
+    if len2 > 0:
+        t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2))
+    return dist(p, (a[0] + t * dx, a[1] + t * dy))
+
+
+def dist_to_contour_edge(point, contour) -> float:
+    """点到闭合轮廓边缘（各边）的最短距离。"""
+    n = len(contour)
+    return min(_point_segment_dist(point, contour[i], contour[(i + 1) % n])
+               for i in range(n))
+
+
+def validate_markers_on_edge(markers, contour):
+    """校验每处标记都位于轮廓边缘（距边缘 ≤ MARKER_EDGE_TOL）。"""
+    for i, m in enumerate(markers):
+        d = dist_to_contour_edge(m, contour)
+        if d > MARKER_EDGE_TOL:
+            raise GeometryError(
+                f"标记不在边缘：第 {i + 1} 处标记距修订轮廓边缘 {d:.3f} mm，"
+                f"超过 {MARKER_EDGE_TOL:.2f} mm 容差")
+
 
 def fit_rigid(src, dst) -> tuple[float, float, float]:
     """最小二乘拟合旋转+平移 T，使 T(src[i]) ≈ dst[i]。

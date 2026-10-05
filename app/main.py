@@ -12,6 +12,10 @@
 - 有序试拼（/api/trials/rehearse）基于版本快照逐步推演，不落库；
   确认（/api/trials/commit）整体提交，任一步失败或版本过期均不写入，
   成功仅递增一次装配版本（详见 trial.py）。
+- 轮廓修订（/api/fragments/{id}/revision[/preview]）：提交修订轮廓与该片
+  每条有效关系的新边缘标记，以现有位姿重校验受影响组；预览不落库，确认
+  原子更新轮廓/标记/误差，位姿、关系 ID、分组与已撤销历史不变，版本只 +1
+  （详见 revision.py）。
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, trial
+from . import geometry, revision, trial
 from .database import DB
 from .trial import TrialError, evaluate_proposal
 
@@ -85,6 +89,21 @@ TrialStep = Union[TrialRelateStep, TrialUndoStep]
 class TrialIn(BaseModel):
     expected_version: int
     steps: list[TrialStep] = Field(default_factory=list)
+
+
+class RevisionMarkersIn(BaseModel):
+    relation_id: int
+    markers: list[list[float]] = Field(default_factory=list)
+
+
+class RevisionPreviewIn(BaseModel):
+    contour: list[list[float]] = Field(default_factory=list)
+    # 该片每条有效拼接关系的新边缘标记（本碎片一侧）
+    relation_markers: list[RevisionMarkersIn] = Field(default_factory=list)
+
+
+class RevisionCommitIn(RevisionPreviewIn):
+    expected_version: int
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -291,6 +310,83 @@ def list_relations():
 def get_assembly():
     """当前装配快照：版本号、碎片位姿、连通组、全部关系。"""
     return get_db().assembly_state()
+
+
+# ---------------------------------------------------------------- 轮廓修订
+
+def _revision_response(ev: dict) -> dict:
+    """把修订演算结果整理成预览响应（剔除内部落库字段）。"""
+    return {
+        "ok": ev["ok"],
+        "fragment_id": ev["fragment_id"],
+        "group_id": ev["group_id"],
+        "conflicts": ev["conflicts"],
+        "relations": [
+            {
+                "relation_id": r["relation_id"],
+                "other_fragment_id": r["other_fragment_id"],
+                "other_fragment_name": r["other_fragment_name"],
+                "errors": [round(e, 4) for e in r["errors"]],
+                "max_error_mm": round(r["max_error_mm"], 4),
+                "markers_self_world": r["markers_self_world"],
+                "markers_other_world": r["markers_other_world"],
+            } for r in ev["relations"]
+        ],
+        "checked_relation_ids": ev["checked_relation_ids"],
+        "contour_world": ev["contour_world"],
+    }
+
+
+@app.post("/api/fragments/{fid}/revision/preview")
+def preview_revision(fid: int, payload: RevisionPreviewIn):
+    """轮廓修订预览：以现有位姿重校验受影响组，返回逐条误差与冲突，不落库。"""
+    d = get_db()
+    with d.lock:
+        frag = d.get_fragment(fid)
+        if frag is None:
+            raise HTTPException(404, f"碎片 #{fid} 不存在")
+        ev = revision.evaluate_revision(
+            d, frag, payload.contour,
+            [{"relation_id": rm.relation_id, "markers": rm.markers}
+             for rm in payload.relation_markers])
+    return _revision_response(ev)
+
+
+@app.post("/api/fragments/{fid}/revision")
+def commit_revision(fid: int, payload: RevisionCommitIn):
+    """确认轮廓修订：事务内重新校验同一输入，全部通过才原子写入。
+
+    更新轮廓、相关关系的标记与误差；位姿、关系 ID、分组与已撤销历史不变，
+    装配版本只递增一次。遗漏有效关系或任一校验失败整次拒绝（400），
+    版本过期返回 409。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            frag = d.get_fragment(fid)
+            if frag is None:
+                raise HTTPException(404, f"碎片 #{fid} 不存在")
+            ev = revision.evaluate_revision(
+                d, frag, payload.contour,
+                [{"relation_id": rm.relation_id, "markers": rm.markers}
+                 for rm in payload.relation_markers])
+            if not ev["ok"]:
+                raise HTTPException(400, detail={
+                    "message": "轮廓修订被拒绝，未写入任何变化",
+                    "conflicts": ev["conflicts"],
+                })
+            revision.apply_revision(d, ev)
+            new_version = d.bump_version()
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "version": new_version, "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 有序试拼

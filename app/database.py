@@ -147,6 +147,20 @@ class DB:
             "UPDATE fragments SET x = ?, y = ?, theta = ? WHERE id = ?",
             (pose[0], pose[1], pose[2], fid))
 
+    def update_contour(self, fid: int, contour):
+        """轮廓修订：只替换轮廓，位姿与分组保持不变。"""
+        self.conn.execute(
+            "UPDATE fragments SET contour = ? WHERE id = ?",
+            (json.dumps(contour), fid))
+
+    def update_relation_geometry(self, rid: int, markers_a, markers_b,
+                                 max_error: float):
+        """轮廓修订：只更新关系两侧标记与误差，关系 ID / 状态 / 时间不变。"""
+        self.conn.execute(
+            "UPDATE relations SET markers_a = ?, markers_b = ?, max_error = ?"
+            " WHERE id = ?",
+            (json.dumps(markers_a), json.dumps(markers_b), max_error, rid))
+
     def insert_relation(self, fa: int, fb: int, markers_a, markers_b,
                         max_error: float) -> int:
         cur = self.conn.execute(
