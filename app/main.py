@@ -12,6 +12,10 @@
 - 有序试拼（/api/trials/rehearse）基于版本快照逐步推演，不落库；
   确认（/api/trials/commit）整体提交，任一步失败或版本过期均不写入，
   成功仅递增一次装配版本（详见 trial.py）。
+- 轮廓修订（/api/fragments/{id}/revision/preview|confirm）：提交修订后的
+  毫米制闭合轮廓及该片每条有效关系的新边缘标记，以现有位姿校验受影响组
+  误差与碰撞；预览不落库，确认时重新校验同一输入并原子更新，位姿、关系
+  ID、分组、已撤销历史不变，装配版本只 +1（详见 revision.py）。
 """
 from __future__ import annotations
 
@@ -24,8 +28,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import geometry, trial
+from . import geometry, revision, trial
 from .database import DB
+from .revision import RevisionError, evaluate_revision
 from .trial import TrialError, evaluate_proposal
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +90,18 @@ TrialStep = Union[TrialRelateStep, TrialUndoStep]
 class TrialIn(BaseModel):
     expected_version: int
     steps: list[TrialStep] = Field(default_factory=list)
+
+
+class RevisionRelationIn(BaseModel):
+    relation_id: int
+    markers: list[list[float]] = Field(default_factory=list)
+
+
+class RevisionIn(BaseModel):
+    contour: list[list[float]] = Field(min_length=3)
+    # 本片每一条有效关系的新边缘标记（遗漏有效关系会被整次拒绝）
+    relations: list[RevisionRelationIn] = Field(default_factory=list)
+    expected_version: int
 
 
 # ---------------------------------------------------------------- 拼接演算
@@ -181,6 +198,104 @@ def delete_fragment(fid: int, expected_version: int):
             d.conn.rollback()
             raise
     return {"ok": True, "assembly": d.assembly_state()}
+
+
+# ---------------------------------------------------------------- 轮廓修订 API
+
+def _revision_response(fid: int, expected_version: int, ev: dict) -> dict:
+    """把 evaluate_revision 结果整理为预览/确认共用的响应体（不落库语义）。"""
+    rel_rows = []
+    for row in ev["relations"]:
+        rel_rows.append({
+            "relation_id": row["relation_id"],
+            "revised": row["revised"],
+            "side": row["side"],
+            "fragment_a": row["fragment_a"],
+            "fragment_b": row["fragment_b"],
+            "other_fragment_id": row["other_fragment_id"],
+            "required_count": row["required_count"],
+            "marker_count": row["marker_count"],
+            "errors": [round(e, 4) for e in row["errors"]],
+            "max_error_mm": (round(row["max_error_mm"], 4)
+                             if row["max_error_mm"] is not None else None),
+            "conflicts": row["conflicts"],
+            "markers_a": row["markers_a"],
+            "markers_b": row["markers_b"],
+        })
+    return {
+        "ok": ev["ok"],
+        "fragment_id": fid,
+        "expected_version": expected_version,
+        "independent": ev["independent"],
+        "missing_relation_ids": ev["missing_relation_ids"],
+        "contour": [list(p) for p in ev["contour"]] if ev["contour"] else None,
+        "conflicts": ev["conflicts"],
+        "relations": rel_rows,
+        "overlaps": [
+            {"fragment_a": o["fragment_a"], "fragment_b": o["fragment_b"],
+             "name_a": o["name_a"], "name_b": o["name_b"],
+             "area_mm2": round(o["area_mm2"], 6)}
+            for o in ev["overlaps"]
+        ],
+        "involved_fragment_ids": ev["involved"],
+    }
+
+
+@app.post("/api/fragments/{fid}/revision/preview")
+def preview_revision(fid: int, payload: RevisionIn):
+    """预览轮廓修订：逐条误差与冲突原因，不写库。版本过期返回 409。"""
+    d = get_db()
+    with d.lock:
+        _check_version(d, payload.expected_version)
+        if d.get_fragment(fid) is None:
+            raise HTTPException(404, f"碎片 #{fid} 不存在")
+        rel_inputs = [(r.relation_id, r.markers) for r in payload.relations]
+        try:
+            ev = evaluate_revision(d, fid, payload.contour, rel_inputs)
+        except RevisionError as e:
+            raise HTTPException(e.status, e.detail())
+        return _revision_response(fid, payload.expected_version, ev)
+
+
+@app.post("/api/fragments/{fid}/revision/confirm", status_code=201)
+def confirm_revision(fid: int, payload: RevisionIn):
+    """确认轮廓修订：重新校验同一输入，原子更新轮廓/相关标记/误差。
+
+    位姿、关系 ID、连通分组、已撤销历史保持不变；成功后装配版本只 +1。
+    校验失败整次拒绝（不写入任何变化）；版本过期返回 409。
+    """
+    d = get_db()
+    with d.lock:
+        try:
+            d.conn.execute("BEGIN IMMEDIATE")
+            _check_version(d, payload.expected_version)
+            if d.get_fragment(fid) is None:
+                raise HTTPException(404, f"碎片 #{fid} 不存在")
+            rel_inputs = [(r.relation_id, r.markers) for r in payload.relations]
+            try:
+                ev = evaluate_revision(d, fid, payload.contour, rel_inputs)
+            except RevisionError as e:
+                raise HTTPException(e.status, e.detail())
+            if not ev["ok"]:
+                raise HTTPException(400, detail={
+                    "message": "轮廓修订被拒绝，未写入任何变化",
+                    **_revision_response(fid, payload.expected_version, ev),
+                })
+            d.update_fragment_contour(fid, ev["contour"])
+            for rid, up in ev["updates"].items():
+                d.update_relation_side(rid, up["side"], up["markers"],
+                                       up["max_error"])
+            # 不调用 recompute_groups：分组必须保持不变
+            new_version = d.bump_version()
+            d.conn.commit()
+        except HTTPException:
+            d.conn.rollback()
+            raise
+        except Exception:
+            d.conn.rollback()
+            raise HTTPException(500, "内部错误，本次操作未生效")
+    return {"ok": True, "fragment_id": fid, "version": new_version,
+            "assembly": d.assembly_state()}
 
 
 # ---------------------------------------------------------------- 拼接 API

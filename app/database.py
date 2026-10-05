@@ -147,6 +147,33 @@ class DB:
             "UPDATE fragments SET x = ?, y = ?, theta = ? WHERE id = ?",
             (pose[0], pose[1], pose[2], fid))
 
+    def update_fragment_contour(self, fid: int, contour):
+        """仅更新轮廓；位姿（x/y/theta）、分组保持不变。"""
+        self.conn.execute(
+            "UPDATE fragments SET contour = ? WHERE id = ?",
+            (json.dumps(contour), fid))
+
+    def update_relation_side(self, rid: int, side: str | None, markers,
+                             max_error: float):
+        """更新关系的边缘标记与最新最大对应点误差。
+
+        side="a"/"b" 时同时替换该侧标记（轮廓修订的本片侧）；side=None 时
+        只刷新最大误差（受影响组内不涉及修订片、标记未变的关系）。
+        关系 id、两侧碎片归属、active 状态、created_at、undone_at 均不变。
+        """
+        if side == "a":
+            self.conn.execute(
+                "UPDATE relations SET markers_a = ?, max_error = ? WHERE id = ?",
+                (json.dumps(markers), max_error, rid))
+        elif side == "b":
+            self.conn.execute(
+                "UPDATE relations SET markers_b = ?, max_error = ? WHERE id = ?",
+                (json.dumps(markers), max_error, rid))
+        else:
+            self.conn.execute(
+                "UPDATE relations SET max_error = ? WHERE id = ?",
+                (max_error, rid))
+
     def insert_relation(self, fa: int, fb: int, markers_a, markers_b,
                         max_error: float) -> int:
         cur = self.conn.execute(

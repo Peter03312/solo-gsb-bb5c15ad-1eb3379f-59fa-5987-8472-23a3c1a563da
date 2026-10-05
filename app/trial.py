@@ -123,7 +123,7 @@ def evaluate_proposal(state, fa: dict, fb: dict,
          geometry.contour_world(by_id[fid]["contour"], poses[fid]))
         for fid in sorted(involved)
     ]
-    for n1, n2, area in geometry.find_overlaps(placed):
+    for _k1, _k2, n1, n2, area in geometry.find_overlaps(placed):
         conflicts.append(
             f"碰撞：碎片「{n1}」与「{n2}」轮廓内部重叠 {area:.2f} mm²")
 

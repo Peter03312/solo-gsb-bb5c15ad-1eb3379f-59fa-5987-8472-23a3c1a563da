@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import math
 
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.validation import explain_validity
 
 MAX_ERROR_MM = 1.0        # 同组对应点误差上限（毫米）
 OVERLAP_AREA_TOL = 1e-6   # 轮廓内部重叠面积容差（mm²）
 MARKER_DIST_TOL = 1e-6    # 标记重合判定距离（mm）
+EDGE_TOL_MM = 1e-6        # 边缘标记到轮廓边界的距离容差（mm）
 CLOSE_TOL = 1e-9          # 闭合重复点判定容差
 
 
@@ -75,6 +76,30 @@ def validate_markers(markers_a, markers_b):
     return out[0], out[1]
 
 
+def validate_side_markers(markers, contour) -> list[tuple[float, float]]:
+    """校验单侧修订标记（轮廓修订时使用）：
+
+    至少 2 处、同片标记不重合、每个标记位于给定闭合轮廓的边缘
+    （到边界距离 ≤ EDGE_TOL_MM，顶点与边上点均可）。
+    """
+    pts = [(float(m[0]), float(m[1])) for m in markers]
+    if len(pts) < 2:
+        raise GeometryError("每片陶片至少需要 2 处对应边缘标记")
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            if dist(pts[i], pts[j]) < MARKER_DIST_TOL:
+                raise GeometryError(
+                    f"标记重合：本片第 {i + 1} 处与第 {j + 1} 处标记位置相同")
+    boundary = LineString(list(contour) + [contour[0]])
+    off = [i + 1 for i, p in enumerate(pts)
+           if boundary.distance(Point(p)) > EDGE_TOL_MM]
+    if off:
+        which = "、".join(str(i) for i in off)
+        raise GeometryError(
+            f"新标记必须位于修订后的轮廓边缘：第 {which} 处标记不在轮廓边缘上")
+    return pts
+
+
 # ---------------------------------------------------------------- 刚体变换
 
 def fit_rigid(src, dst) -> tuple[float, float, float]:
@@ -130,10 +155,11 @@ def pair_errors(markers_a, markers_b, pose_a, pose_b) -> list[float]:
 
 # ---------------------------------------------------------------- 碰撞
 
-def find_overlaps(placed) -> list[tuple[str, str, float]]:
+def find_overlaps(placed) -> list[tuple]:
     """检查世界坐标轮廓两两是否内部重叠（允许共边/共点，不允许面积重叠）。
 
-    placed: [(key, name, world_contour)]，返回 [(name1, name2, area_mm2)]。
+    placed: [(key, name, world_contour)]，返回
+    [(key1, key2, name1, name2, area_mm2)]。
     """
     polys = [(key, name, Polygon(contour)) for key, name, contour in placed]
     overlaps = []
@@ -141,5 +167,6 @@ def find_overlaps(placed) -> list[tuple[str, str, float]]:
         for j in range(i + 1, len(polys)):
             area = polys[i][2].intersection(polys[j][2]).area
             if area > OVERLAP_AREA_TOL:
-                overlaps.append((polys[i][1], polys[j][1], area))
+                overlaps.append((polys[i][0], polys[j][0],
+                                 polys[i][1], polys[j][1], area))
     return overlaps
